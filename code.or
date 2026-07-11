@@ -1,0 +1,174 @@
+# ─────────────────────────────────────────────
+# Ball Robot Controller
+# Raspberry Pi Zero 2W · 3 DC motors (T-shape) · MPU6050 · Adafruit Motor HAT
+# Run with: origin i code.or
+# ─────────────────────────────────────────────
+
+# ──── Constants ────
+const ALPHA: float = 0.98
+const LOOP_HZ: int = 100
+let LOOP_DT: float = 0.01
+
+# ──── State ────
+let angle_x: float = 0.0
+let angle_y: float = 0.0
+let accel_angle_x: float = 0.0
+let accel_angle_y: float = 0.0
+let gyro_x: float = 0.0
+let gyro_y: float = 0.0
+
+# ──── Hardware init (Python libraries — no Origin equivalent) ────
+py {
+    import time
+    import struct
+    import smbus2
+    from board import SCL, SDA
+    import busio
+    from adafruit_motorkit import MotorKit
+
+    _mpu_bus = smbus2.SMBus(1)
+    _MPU_ADDR = 0x68
+
+    def mpu_init():
+        _mpu_bus.write_byte_data(_MPU_ADDR, 0x6B, 0x00)
+        _mpu_bus.write_byte_data(_MPU_ADDR, 0x1B, 0x00)
+        _mpu_bus.write_byte_data(_MPU_ADDR, 0x1C, 0x00)
+
+    def mpu_read_accel():
+        raw = _mpu_bus.read_i2c_block_data(_MPU_ADDR, 0x3B, 6)
+        ax = struct.unpack('>h', bytes(raw[0:2]))[0]
+        ay = struct.unpack('>h', bytes(raw[2:4]))[0]
+        az = struct.unpack('>h', bytes(raw[4:6]))[0]
+        return ax, ay, az
+
+    def mpu_read_gyro():
+        raw = _mpu_bus.read_i2c_block_data(_MPU_ADDR, 0x43, 6)
+        gx = struct.unpack('>h', bytes(raw[0:2]))[0]
+        gy = struct.unpack('>h', bytes(raw[2:4]))[0]
+        gz = struct.unpack('>h', bytes(raw[4:6]))[0]
+        return gx, gy, gz
+
+    mpu_init()
+
+    _i2c = busio.I2C(SCL, SDA)
+    _kit = MotorKit(i2c=_i2c)
+
+    def set_motors(m0, m1, m2):
+        _kit.motor1.throttle = max(-1.0, min(1.0, m0))
+        _kit.motor2.throttle = max(-1.0, min(1.0, m1))
+        _kit.motor3.throttle = max(-1.0, min(1.0, m2))
+}
+
+# ──── IMU read (py — needs I2C block read + atan2) ────
+def read_imu() {
+    py {
+        import math
+        ax, ay, az = mpu_read_accel()
+        gx, gy, gz = mpu_read_gyro()
+        global accel_angle_x, accel_angle_y, gyro_x, gyro_y
+        accel_angle_x = math.atan2(ay, math.sqrt(ax * ax + az * az)) * 180.0 / math.pi
+        accel_angle_y = math.atan2(-ax, math.sqrt(ay * ay + az * az)) * 180.0 / math.pi
+        gyro_x = gy / 131.0
+        gyro_y = -gx / 131.0
+    }
+}
+
+# ──── Complementary filter (native Origin math) ────
+def update_angles(dt) {
+    read_imu()
+    angle_x = ALPHA * (angle_x + gyro_x * dt) + (1 - ALPHA) * accel_angle_x
+    angle_y = ALPHA * (angle_y + gyro_y * dt) + (1 - ALPHA) * accel_angle_y
+}
+
+# ──── PID controller (native Origin class + logic) ────
+class PID(kp, ki, kd, ff, limit) {
+    def init() {
+        py {
+            self.integral = 0.0
+            self.prev_error = 0.0
+            self.prev_time = None
+        }
+    }
+
+    def compute(setpoint, measurement) {
+        py {
+            import time
+            now = time.monotonic()
+            if self.prev_time is None:
+                self.prev_time = now
+            dt = now - self.prev_time
+            if dt <= 0:
+                dt = 1e-3
+            self.prev_time = now
+        }
+
+        let error = setpoint - measurement
+
+        self.integral = self.integral + error * dt
+        if self.integral > self.limit {
+            self.integral = self.limit
+        }
+        if self.integral < -self.limit {
+            self.integral = -self.limit
+        }
+
+        let derivative = (error - self.prev_error) / dt
+        self.prev_error = error
+
+        let output = self.kp * error + self.ki * self.integral + self.kd * derivative + self.ff * setpoint
+
+        if output > self.limit {
+            output = self.limit
+        }
+        if output < -self.limit {
+            output = -self.limit
+        }
+
+        return output
+    }
+
+    def reset() {
+        self.integral = 0.0
+        self.prev_error = 0.0
+        self.prev_time = none
+    }
+}
+
+# ──── Instantiate PID controllers ────
+let pid_roll = PID(0.010, 0.001, 0.002, 0.005, 1.0)
+pid_roll.init()
+let pid_pitch = PID(0.010, 0.001, 0.002, 0.005, 1.0)
+pid_pitch.init()
+
+# ──── Motor mixing — T-shape (native Origin math) ────
+#     M1
+#     |
+#  M0-+-M2
+def motor_mix(pitch_out, roll_out) {
+    let m0 = roll_out
+    let m1 = pitch_out
+    let m2 = -roll_out
+    set_motors(m0, m1, m2)
+}
+
+# ──── Main loop (native Origin control flow) ────
+print "Ball robot starting — Ctrl+C to stop"
+py { time.sleep(1.0) }
+
+while true {
+    py { t0 = time.monotonic() }
+
+    update_angles(LOOP_DT)
+
+    let roll_out = pid_roll.compute(0.0, angle_x)
+    let pitch_out = pid_pitch.compute(0.0, angle_y)
+
+    motor_mix(pitch_out, roll_out)
+
+    py {
+        elapsed = time.monotonic() - t0
+        sleep_time = LOOP_DT - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+    }
+}
